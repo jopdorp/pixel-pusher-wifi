@@ -26,10 +26,68 @@
 #include "transformer.h"
 #include "pp-server.h"
 
+#include <sstream>
+#include <sys/types.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <memory.h>
+#include <ifaddrs.h>
+#include <net/if.h>
+#include <errno.h>
+#include <stdlib.h>
+#include <iostream>
+
 using namespace rgb_matrix;
 
 static const int kMaxUDPPacketSize = 65507;  // largest practical w/ IPv4 header
 static const int kDefaultUDPPacketSize = 1460;
+
+int sock[20] = {};
+sockaddr_storage addrDest[20] = {};
+
+int resolvehelper(const char* hostname, int family, const char* service, sockaddr_storage* pAddr){
+      int result;
+      addrinfo* result_list = NULL;
+      addrinfo hints = {};
+      hints.ai_family = family;
+      hints.ai_socktype = SOCK_DGRAM; // without this flag, getaddrinfo will return 3x the number of addresses (one for each socket type).
+      result = getaddrinfo(hostname, service, &hints, &result_list);
+      if (result == 0)
+      {
+          //ASSERT(result_list->ai_addrlen <= sizeof(sockaddr_in));
+          memcpy(pAddr, result_list->ai_addr, result_list->ai_addrlen);
+          freeaddrinfo(result_list);
+      }
+
+      return result;
+  }
+
+void connect(int tubeNumber){
+	int result = 0;
+	addrDest[tubeNumber] = {};
+	sock[tubeNumber] = socket(AF_INET, SOCK_DGRAM, 0);
+
+
+	std::ostringstream ipAddr;
+	ipAddr << "10.100.1." << 60 + tubeNumber;
+
+	result = resolvehelper(ipAddr.str().c_str(), AF_INET, "8888", &(addrDest[tubeNumber]));
+	if (result != 0)	{
+		int lasterror = errno;
+		std::cout << "error: " << lasterror;
+		exit(1);
+	}
+}
+
+int pixelNum = 0;
+int skip = 0;
+int redPixels[120] = {};
+int greenPixels[120] = {};
+int bluePixels[120]  = {};
 
 // Interface to our RGBMatrix
 class RGBMatrixDevice : public pp::OutputDevice {
@@ -38,9 +96,13 @@ public:
   RGBMatrixDevice(rgb_matrix::RGBMatrix *matrix)
     : matrix_(matrix),
       off_screen_(matrix_->CreateFrameCanvas()),
-      on_screen_(matrix_->SwapOnVSync(NULL)),
-      draw_canvas_(NULL) {
+      on_screen_(matrix_->SwapOnVSync(NULL)) {
+	for(int i = 0; i < 20; i++){
+	  connect(i);
+	}
   }
+
+
 
   ~RGBMatrixDevice() { delete matrix_; }
 
@@ -51,27 +113,77 @@ public:
     // If we get a full update, we write the output to an off-screen and swap
     // on next VSync to minimize tearing.
     full_update_requested_ = full_update;
-    draw_canvas_ = full_update_requested_ ? off_screen_ : on_screen_;
+    //draw_canvas_ = full_update_requested_ ? off_screen_ : on_screen_;
   }
 
   virtual void SetPixel(int strip, int pixel,
                         const ::pp::PixelColor &col) {
-    draw_canvas_->SetPixel(pixel, strip, col.red, col.green, col.blue);
+    //draw_canvas_->SetPixel(pixel, strip, col.red, col.green, col.blue);
+    sendPixel(pixel, strip, col.red, col.green, col.blue);
   }
 
   virtual void FlushFrame() {
-    if (full_update_requested_) {
-      on_screen_ = off_screen_;
-      off_screen_ = matrix_->SwapOnVSync(off_screen_);
-    }
+    //if (full_update_requested_) {
+    //  on_screen_ = off_screen_;
+    //  off_screen_ = matrix_->SwapOnVSync(off_screen_);
+    //}
   }
 
 private:
+  void sendPixel(int x, int y, int r, int g, int b){
+      redPixels[pixelNum] = r;
+      greenPixels[pixelNum] = g;
+      bluePixels[pixelNum] = b;
+
+      if(pixelNum == 119){
+      //if(pixelNum == 39){
+//	if(skip == 4){
+//	skip = 0;
+	pixelNum = 0;
+	//if(y%3 == 0){
+
+
+	for(int i = 0; i < 12; i++){
+	//for(int i = 0; i < 4; i++){
+	  std::ostringstream msg;
+	  msg << "{\"r\":" << arrayToString(redPixels,i) << ",\"g\":" << arrayToString(greenPixels,i) << ",\"b\":" << arrayToString(bluePixels,i)
+		<< ",\"start\":" << i * 10
+		<< "}";
+  	  std::string messageString = msg.str();
+	  int tubeNumber = y/3;
+	  sockaddr_storage addrTube = addrDest[tubeNumber];
+          sendto(sock[tubeNumber], (const char*)messageString.c_str(), messageString.length(), 0, (sockaddr*)&addrTube, sizeof(addrTube));
+          //sendto(sock, (const char*)messageString.c_str(), messageString.length(), 0, (sockaddr*)&(addrDest[y]), sizeof(addrDest[y]));
+          //sendto(sock, (const char*)messageString.c_str(), messageString.length(), 0, (sockaddr*)&(addrDest[1]), sizeof(addrDest[1]));
+	}
+	//}
+//	}else{
+//	  skip++;
+//	}
+      }else{
+        pixelNum++;
+      }
+  }
+
+  const char* arrayToString(int* intArray, int stripNumber){
+    std::ostringstream oss;
+    oss << "[";
+    int first = stripNumber * 10;
+    int last = first + 10;
+    for(int i = first; i < last; i++){
+      if(i != first){
+        oss << ",";
+      }
+      oss << intArray[i];
+    }
+    oss << "]";
+    return oss.str().c_str();
+  }
+
   RGBMatrix *const matrix_;
   FrameCanvas *off_screen_;
   FrameCanvas *on_screen_;
   bool full_update_requested_;
-  Canvas *draw_canvas_;
 };
 
 static int usage(const char *progname) {
